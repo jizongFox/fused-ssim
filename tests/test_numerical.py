@@ -24,5 +24,3 @@ print("image1 grad norm:", image_1_grad.norm())
 print("image2 grad norm:", image_2_grad.norm())
 print("image1 grad2 norm:", image_1_grad2.norm())
 print("image2 grad2 norm:", image_2_grad2.norm())
-
-

@@ -21,14 +21,23 @@ elif torch.mps.is_available():
     gpu = "Apple Silicon (MPS)"
     fused_ssim_device = "mps"
     fused_ssim_module = torch.mps
-elif hasattr(torch, 'xpu') and torch.xpu.is_available():
+elif hasattr(torch, "xpu") and torch.xpu.is_available():
     # XPU backend for Intel GPUs (via SYCL/oneAPI)
     gpu = torch.xpu.get_device_name(0)
     fused_ssim_device = "xpu"
     fused_ssim_module = torch.xpu
 
 # Load ground truth image and normalize to [0, 1] range
-gt_image = torch.tensor(np.array(Image.open(os.path.join("..", "images", "albert.jpg"))), dtype=torch.float32, device=fused_ssim_device).unsqueeze(0).unsqueeze(0) / 255.0
+gt_image = (
+    torch.tensor(
+        np.array(Image.open(os.path.join("..", "images", "albert.jpg"))),
+        dtype=torch.float32,
+        device=fused_ssim_device,
+    )
+    .unsqueeze(0)
+    .unsqueeze(0)
+    / 255.0
+)
 
 # Initialize predicted image with random values (to be optimized)
 pred_image = torch.nn.Parameter(torch.rand_like(gt_image))
@@ -57,4 +66,6 @@ while ssim_value < 0.9999:
 pred_image = (pred_image * 255.0).squeeze(0).squeeze(0)
 to_save = pred_image.detach().cpu().numpy().astype(np.uint8)
 
-Image.fromarray(to_save).save(os.path.join("..", "images", f"predicted-{gpu.lower().replace(' ', '-')}.jpg"))
+Image.fromarray(to_save).save(
+    os.path.join("..", "images", f"predicted-{gpu.lower().replace(' ', '-')}.jpg")
+)

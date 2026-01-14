@@ -6,7 +6,7 @@ import numpy as np
 import time
 import os
 
-plt.style.use('ggplot')
+plt.style.use("ggplot")
 
 # GPU Device Detection and Configuration
 # This script supports benchmarking on multiple GPU backends:
@@ -25,7 +25,7 @@ elif torch.mps.is_available():
     gpu = "Apple Silicon (MPS)"
     fused_ssim_device = "mps"
     fused_ssim_module = torch.mps
-elif hasattr(torch, 'xpu') and torch.xpu.is_available():
+elif hasattr(torch, "xpu") and torch.xpu.is_available():
     # XPU backend for Intel GPUs (via SYCL/oneAPI)
     gpu = torch.xpu.get_device_name(0)
     fused_ssim_device = "xpu"
@@ -39,10 +39,7 @@ if __name__ == "__main__":
     dimensions = list(range(50, 1550, 50))
     iterations = 50
 
-    data = {
-        "pytorch_mssim": [],
-        "fused-ssim": []
-    }
+    data = {"pytorch_mssim": [], "fused-ssim": []}
 
     pm_ssim = SSIM(data_range=1.0, channel=CH)
 
@@ -81,12 +78,14 @@ if __name__ == "__main__":
     plt.xlabel("Number of pixels (in millions).")
     plt.ylabel("Time for one training iteration (ms).")
     plt.title(f"Training Benchmark on {gpu}.")
-    plt.savefig(os.path.join("..", "images", f"training_time-{gpu.lower().replace(' ', '-')}.png"), dpi=300)
+    plt.savefig(
+        os.path.join(
+            "..", "images", f"training_time-{gpu.lower().replace(' ', '-')}.png"
+        ),
+        dpi=300,
+    )
 
-    data = {
-        "pytorch_mssim": [],
-        "fused-ssim": []
-    }
+    data = {"pytorch_mssim": [], "fused-ssim": []}
 
     plt.clf()
 
@@ -111,7 +110,9 @@ if __name__ == "__main__":
 
             begin = time.time()
             for _ in range(iterations):
-                mine_ssim_val_same = fused_ssim(img1_mine_same, img2_mine_same, train=False)
+                mine_ssim_val_same = fused_ssim(
+                    img1_mine_same, img2_mine_same, train=False
+                )
             fused_ssim_module.synchronize()  # Ensure GPU operations complete before timing
             end = time.time()
             data["fused-ssim"].append((end - begin) / iterations * 1000)
@@ -123,4 +124,9 @@ if __name__ == "__main__":
     plt.xlabel("Number of pixels (in millions).")
     plt.ylabel("Time for one inference iteration (ms).")
     plt.title(f"Inference Benchmark on {gpu}.")
-    plt.savefig(os.path.join("..", "images", f"inference_time-{gpu.lower().replace(' ', '-')}.png"), dpi=300)
+    plt.savefig(
+        os.path.join(
+            "..", "images", f"inference_time-{gpu.lower().replace(' ', '-')}.png"
+        ),
+        dpi=300,
+    )
