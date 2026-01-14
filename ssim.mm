@@ -55,6 +55,8 @@ kernel void fusedssim_forward(
       device float*       dm_dmu1        [[buffer(9)]],
       device float*       dm_dsigma1_sq  [[buffer(10)]],
       device float*       dm_dsigma12    [[buffer(11)]],
+      device float*       dm_dmu2        [[buffer(12)]],
+      device float*       dm_dsigma2_sq  [[buffer(13)]],
       uint3               gid            [[thread_position_in_grid]],
       uint3               tid            [[thread_position_in_threadgroup]],
       uint3               tgroup_size    [[threads_per_threadgroup]],
@@ -243,7 +245,7 @@ kernel void fusedssim_forward(
                 ssim_map[global_idx] = val;
 
                 if (dm_dmu1 != nullptr) {
-                    // partial derivatives
+                    // partial derivatives for img1
                     float d_m_dmu1 = (
                         (mu2 * 2.f * D_) / (A * B)
                         - (mu2 * 2.f * C_) / (A * B)
@@ -256,6 +258,18 @@ kernel void fusedssim_forward(
                     dm_dmu1[global_idx]       = d_m_dmu1;
                     dm_dsigma1_sq[global_idx] = d_m_dsigma1_sq;
                     dm_dsigma12[global_idx]   = d_m_dsigma12;
+                    
+                    // partial derivatives for img2
+                    float d_m_dmu2 = (
+                        (mu1 * 2.f * D_) / (A * B)
+                        - (mu1 * 2.f * C_) / (A * B)
+                        - (mu2 * 2.f * C_ * D_) / (A * A * B)
+                        + (mu2 * 2.f * C_ * D_) / (A * B * B)
+                    );
+                    float d_m_dsigma2_sq = (-C_ * D_) / (A * B * B);
+                    
+                    dm_dmu2[global_idx]       = d_m_dmu2;
+                    dm_dsigma2_sq[global_idx] = d_m_dsigma2_sq;
                 }
             }
         }
@@ -417,6 +431,150 @@ kernel void fusedssim_backward(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     } // channel loop
 }
+
+kernel void fusedssim_backward_img2(
+    device const float* img1       [[ buffer(0) ]],
+    device const float* img2       [[ buffer(1) ]],
+    device const float* dL_dmap    [[ buffer(2) ]],
+    device const float* dm_dmu2    [[ buffer(3) ]],
+    device const float* dm_ds2     [[ buffer(4) ]],
+    device const float* dm_ds12    [[ buffer(5) ]],
+    constant float&     C1         [[ buffer(6) ]],
+    constant float&     C2         [[ buffer(7) ]],
+    constant int&       H          [[ buffer(8) ]],
+    constant int&       W          [[ buffer(9) ]],
+    constant int&       CH         [[ buffer(10) ]],
+    constant int&       B          [[ buffer(11) ]],
+    device float*       dL_dimg2   [[ buffer(12) ]],
+    uint3 gid                      [[ thread_position_in_grid ]],
+    uint3 tid                      [[ thread_position_in_threadgroup ]],
+    uint3 tgroup_size              [[ threads_per_threadgroup ]],
+    uint3 tgroup_pos               [[ threadgroup_position_in_grid ]],
+    uint  thread_index             [[ thread_index_in_threadgroup ]]
+) {
+    const int pix_x = int(gid.x);
+    const int pix_y = int(gid.y);
+    const int pix_id = pix_y * W + pix_x;
+    const int bIdx  = int(tgroup_pos.z);
+    const int num_pix = H * W;
+
+    threadgroup float sData[3][SHARED_Y][SHARED_X];
+    threadgroup float sScratch[CONV_Y][CONV_X][3];
+
+    const int numThreads = int(tgroup_size.x) * int(tgroup_size.y);
+    const int warp_id = int(thread_index) / 32;
+    const int lane_id = int(thread_index) % 32;
+    const int num_warps = (numThreads + 31) / 32;
+
+    for (int c = 0; c < CH; ++c) {
+        float p1 = 0.f, p2 = 0.f;
+        if (pix_x < W && pix_y < H) {
+            p1 = get_pix_value(img1, bIdx, c, pix_y, pix_x, CH, H, W);
+            p2 = get_pix_value(img2, bIdx, c, pix_y, pix_x, CH, H, W);
+        }
+
+        // (1) Load + fuse multiplication
+        {
+            const int start_y = int(tgroup_pos.y) * int(tgroup_size.y);
+            const int start_x = int(tgroup_pos.x) * int(tgroup_size.x);
+
+            for (int row = warp_id; row < SHARED_Y; row += num_warps) {
+                int gy = start_y + row - HALO;
+                for (int col = lane_id; col < SHARED_X; col += 32) {
+                    int gx = start_x + col - HALO;
+
+                    float chain = get_pix_value(dL_dmap, bIdx, c, gy, gx, CH, H, W);
+                    float vmu   = get_pix_value(dm_dmu2, bIdx, c, gy, gx, CH, H, W);
+                    float vs2   = get_pix_value(dm_ds2,  bIdx, c, gy, gx, CH, H, W);
+                    float vs12  = get_pix_value(dm_ds12, bIdx, c, gy, gx, CH, H, W);
+
+                    sData[0][row][col] = vmu  * chain;
+                    sData[1][row][col] = vs2  * chain;
+                    sData[2][row][col] = vs12 * chain;
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // (2) Horizontal pass
+        {
+            int ly = int(tid.y);
+            int lx = int(tid.x) + HALO;
+
+            for (int pass = 0; pass < 2; ++pass) {
+                int yy = ly + pass * BLOCK_Y;
+                if (yy < CONV_Y) {
+                    float accum0 = 0.f, accum1 = 0.f, accum2 = 0.f;
+
+                    for (int d = 1; d <= HALO; ++d) {
+                        float w = cGauss[HALO - d];
+                        float left0  = sData[0][yy][lx - d];
+                        float left1  = sData[1][yy][lx - d];
+                        float left2  = sData[2][yy][lx - d];
+
+                        float right0 = sData[0][yy][lx + d];
+                        float right1 = sData[1][yy][lx + d];
+                        float right2 = sData[2][yy][lx + d];
+
+                        accum0 += (left0 + right0) * w;
+                        accum1 += (left1 + right1) * w;
+                        accum2 += (left2 + right2) * w;
+                    }
+                    // center
+                    {
+                        float wc = cGauss[HALO];
+                        float c0 = sData[0][yy][lx];
+                        float c1 = sData[1][yy][lx];
+                        float c2 = sData[2][yy][lx];
+                        accum0 += c0 * wc;
+                        accum1 += c1 * wc;
+                        accum2 += c2 * wc;
+                    }
+
+                    sScratch[yy][int(tid.x)][0] = accum0;
+                    sScratch[yy][int(tid.x)][1] = accum1;
+                    sScratch[yy][int(tid.x)][2] = accum2;
+                }
+
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // (3) Vertical pass -> finalize dL/d(img2)
+        if (pix_x < W && pix_y < H) {
+            int ly = int(tid.y) + HALO;
+            int lx = int(tid.x);
+
+            float sum0 = 0.f, sum1 = 0.f, sum2 = 0.f;
+
+            for (int d = 1; d <= HALO; ++d) {
+                float w = cGauss[HALO - d];
+                threadgroup float* top = sScratch[ly - d][lx];
+                threadgroup float* bot = sScratch[ly + d][lx];
+
+                sum0 += (top[0] + bot[0]) * w;
+                sum1 += (top[1] + bot[1]) * w;
+                sum2 += (top[2] + bot[2]) * w;
+            }
+            // center
+            {
+                float wc = cGauss[HALO];
+                threadgroup float* ctr = sScratch[ly][lx];
+                sum0 += ctr[0] * wc;
+                sum1 += ctr[1] * wc;
+                sum2 += ctr[2] * wc;
+            }
+
+            float dL_dpix = sum0 + (2.f * p2) * sum1 + (p1) * sum2;
+            int out_idx = bIdx * CH * num_pix + c * num_pix + pix_id;
+            dL_dimg2[out_idx] = dL_dpix;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    } // channel loop
+}
 )FUSED_SSIM_MPS";
 
 // Helper function to retrieve the `MTLBuffer` from a `torch::Tensor`.
@@ -440,7 +598,7 @@ static id<MTLComputePipelineState> build_pipeline(id<MTLDevice> dev, id<MTLLibra
     return pipeline;
 }
 
-std::tuple<torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor>
+std::tuple<torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor>
 fusedssim(
     float C1,
     float C2,
@@ -454,6 +612,8 @@ fusedssim(
     auto out_dm_mu = train ? torch::zeros_like(img1) : torch::empty({0}, img1.options());
     auto out_dm_s1 = train ? torch::zeros_like(img1) : torch::empty({0}, img1.options());
     auto out_dm_s12 = train ? torch::zeros_like(img1) : torch::empty({0}, img1.options());
+    auto out_dm_mu2 = train ? torch::zeros_like(img1) : torch::empty({0}, img1.options());
+    auto out_dm_s2 = train ? torch::zeros_like(img1) : torch::empty({0}, img1.options());
     
     @autoreleasepool{
         // ensure input shapes match
@@ -520,6 +680,8 @@ fusedssim(
                 [enc setBuffer:getMTLBufferStorage(out_dm_mu)  offset:out_dm_mu.storage_offset() * out_dm_mu.element_size() atIndex:9];
                 [enc setBuffer:getMTLBufferStorage(out_dm_s1)  offset:out_dm_s1.storage_offset() * out_dm_s1.element_size() atIndex:10];
                 [enc setBuffer:getMTLBufferStorage(out_dm_s12)  offset:out_dm_s12.storage_offset() * out_dm_s12.element_size() atIndex:11];
+                [enc setBuffer:getMTLBufferStorage(out_dm_mu2)  offset:out_dm_mu2.storage_offset() * out_dm_mu2.element_size() atIndex:12];
+                [enc setBuffer:getMTLBufferStorage(out_dm_s2)  offset:out_dm_s2.storage_offset() * out_dm_s2.element_size() atIndex:13];
             }
             
             MTLSize threadsPerThreadgroup = MTLSizeMake(BLOCK_X, BLOCK_Y, 1);
@@ -534,7 +696,7 @@ fusedssim(
         });
     }
     
-    return std::make_tuple(out_ssim, out_dm_mu, out_dm_s1, out_dm_s12);
+    return std::make_tuple(out_ssim, out_dm_mu, out_dm_s1, out_dm_s12, out_dm_mu2, out_dm_s2);
 }
 
 torch::Tensor
@@ -602,6 +764,97 @@ fusedssim_backward(
             [enc setBuffer:getMTLBufferStorage(dL_dmap_contig) offset:dL_dmap_contig.storage_offset() * dL_dmap_contig.element_size() atIndex:2];
             [enc setBuffer:getMTLBufferStorage(dm_dmu1_contig) offset:dm_dmu1_contig.storage_offset() * dm_dmu1_contig.element_size() atIndex:3];
             [enc setBuffer:getMTLBufferStorage(dm_dsigma1_sq_contig) offset:dm_dsigma1_sq_contig.storage_offset() * dm_dsigma1_sq_contig.element_size() atIndex:4];
+            [enc setBuffer:getMTLBufferStorage(dm_dsigma12_contig) offset:dm_dsigma12_contig.storage_offset() * dm_dsigma12_contig.element_size() atIndex:5];
+            
+            // bind constant input buffers
+            [enc setBuffer:b_C1 offset:0 atIndex:6];
+            [enc setBuffer:b_C2 offset:0 atIndex:7];
+            [enc setBuffer:b_H offset:0 atIndex:8];
+            [enc setBuffer:b_W offset:0 atIndex:9];
+            [enc setBuffer:b_CH offset:0 atIndex:10];
+            [enc setBuffer:b_B offset:0 atIndex:11];
+            
+            // bind tensor output buffer
+            [enc setBuffer:getMTLBufferStorage(out_dL) offset:out_dL.storage_offset() * out_dL.element_size() atIndex:12];
+            
+            MTLSize threadsPerThreadgroup = MTLSizeMake(BLOCK_X, BLOCK_Y, 1);
+            MTLSize threadgroupsPerGrid = MTLSizeMake((W + BLOCK_X - 1) / BLOCK_X,
+                                                      (H + BLOCK_Y - 1) / BLOCK_Y,
+                                                      B);
+            [enc dispatchThreadgroups:threadgroupsPerGrid threadsPerThreadgroup:threadsPerThreadgroup];
+            [enc endEncoding];
+            torch::mps::commit();
+        });
+    }
+    
+    return out_dL;
+}
+
+torch::Tensor
+fusedssim_backward_img2(
+    float C1,
+    float C2,
+    torch::Tensor &img1,
+    torch::Tensor &img2,
+    torch::Tensor &dL_dmap,
+    torch::Tensor &dm_dmu2,
+    torch::Tensor &dm_dsigma2_sq,
+    torch::Tensor &dm_dsigma12
+) {
+    
+    // Setup output tensor
+    torch::Tensor out_dL = torch::zeros_like(img2);
+    
+    @autoreleasepool{
+        int B = img1.size(0);
+        int CH = img1.size(1);
+        int H = img1.size(2);
+        int W = img1.size(3);
+        
+        // Store contiguous inputs
+        auto img1_contig = img1.contiguous();
+        auto img2_contig = img2.contiguous();
+        auto dL_dmap_contig = dL_dmap.contiguous();
+        auto dm_dmu2_contig = dm_dmu2.contiguous();
+        auto dm_dsigma2_sq_contig = dm_dsigma2_sq.contiguous();
+        auto dm_dsigma12_contig = dm_dsigma12.contiguous();
+        
+        // Acquire Metal device and compile shader
+        id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
+        TORCH_CHECK(dev,"No Metal device found");
+        
+        NSError *err = nil;
+        id<MTLLibrary> lib = [dev newLibraryWithSource:[NSString stringWithUTF8String:MPS_KERNEL]
+                                                                  options:nil
+                                                                    error:&err];
+        TORCH_CHECK(lib, "Failed to to create backward pass kernel library, error: ", err.localizedDescription.UTF8String);
+        
+        id<MTLComputePipelineState> pipe = build_pipeline(dev, lib, "fusedssim_backward_img2");
+        TORCH_CHECK(pipe,"Failed to create pipeline for backward_img2");
+    
+        // Setup constant buffers
+        id<MTLBuffer> b_C1 = [dev newBufferWithBytes:&C1 length:sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> b_C2 = [dev newBufferWithBytes:&C2 length:sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> b_H  = [dev newBufferWithBytes:&H  length:sizeof(int)   options:MTLResourceStorageModeShared];
+        id<MTLBuffer> b_W  = [dev newBufferWithBytes:&W  length:sizeof(int)   options:MTLResourceStorageModeShared];
+        id<MTLBuffer> b_CH = [dev newBufferWithBytes:&CH length:sizeof(int)   options:MTLResourceStorageModeShared];
+        id<MTLBuffer> b_B  = [dev newBufferWithBytes:&B  length:sizeof(int)   options:MTLResourceStorageModeShared];
+        
+        // Get torch's MPS command buffer and dispatch queue
+        id<MTLCommandBuffer> cb = torch::mps::get_command_buffer();
+        dispatch_queue_t serialQueue = torch::mps::get_dispatch_queue();
+        
+        // Add input buffers from above + tensors, and dispatch backward kernel through torch mps
+        dispatch_sync(serialQueue, ^(){
+            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            [enc setComputePipelineState:pipe];
+            
+            // bind tensor input buffers
+            [enc setBuffer:getMTLBufferStorage(img1_contig) offset:img1_contig.storage_offset() * img1_contig.element_size() atIndex:0];
+            [enc setBuffer:getMTLBufferStorage(img2_contig) offset:img2_contig.storage_offset() * img2_contig.element_size() atIndex:1];
+            [enc setBuffer:getMTLBufferStorage(dL_dmap_contig) offset:dL_dmap_contig.storage_offset() * dL_dmap_contig.element_size() atIndex:2];
+            [enc setBuffer:getMTLBufferStorage(dm_dmu2_contig) offset:dm_dmu2_contig.storage_offset() * dm_dmu2_contig.element_size() atIndex:3];
+            [enc setBuffer:getMTLBufferStorage(dm_dsigma2_sq_contig) offset:dm_dsigma2_sq_contig.storage_offset() * dm_dsigma2_sq_contig.element_size() atIndex:4];
             [enc setBuffer:getMTLBufferStorage(dm_dsigma12_contig) offset:dm_dsigma12_contig.storage_offset() * dm_dsigma12_contig.element_size() atIndex:5];
             
             // bind constant input buffers

@@ -71,6 +71,8 @@ struct FusedSSIMForwardKernel {
     float* m_dm_dmu1;
     float* m_dm_dsigma1_sq;
     float* m_dm_dsigma12;
+    float* m_dm_dmu2;
+    float* m_dm_dsigma2_sq;
     sycl::local_accessor<float, 3> m_sTile;
     sycl::local_accessor<float, 3> m_xconv;
 
@@ -86,6 +88,8 @@ struct FusedSSIMForwardKernel {
         float* dm_dmu1,
         float* dm_dsigma1_sq,
         float* dm_dsigma12,
+        float* dm_dmu2,
+        float* dm_dsigma2_sq,
         sycl::local_accessor<float, 3> sTile,
         sycl::local_accessor<float, 3> xconv
     ) :
@@ -100,6 +104,8 @@ struct FusedSSIMForwardKernel {
         m_dm_dmu1(dm_dmu1),
         m_dm_dsigma1_sq(dm_dsigma1_sq),
         m_dm_dsigma12(dm_dsigma12),
+        m_dm_dmu2(dm_dmu2),
+        m_dm_dsigma2_sq(dm_dsigma2_sq),
         m_sTile(sTile),
         m_xconv(xconv)
     {}
@@ -285,7 +291,7 @@ struct FusedSSIMForwardKernel {
                     m_ssim_map[global_idx] = val;
 
                     if (m_dm_dmu1) {
-                        // partial derivatives
+                        // partial derivatives for img1
                         float d_m_dmu1 = (
                             (mu2 * 2.f * D_) / (A * B)
                             - (mu2 * 2.f * C_) / (A * B)
@@ -298,6 +304,18 @@ struct FusedSSIMForwardKernel {
                         m_dm_dmu1[global_idx]       = d_m_dmu1;
                         m_dm_dsigma1_sq[global_idx] = d_m_dsigma1_sq;
                         m_dm_dsigma12[global_idx]   = d_m_dsigma12;
+                        
+                        // partial derivatives for img2
+                        float d_m_dmu2 = (
+                            (mu1 * 2.f * D_) / (A * B)
+                            - (mu1 * 2.f * C_) / (A * B)
+                            - (mu2 * 2.f * C_ * D_) / (A * A * B)
+                            + (mu2 * 2.f * C_ * D_) / (A * B * B)
+                        );
+                        float d_m_dsigma2_sq = (-C_ * D_) / (A * B * B);
+                        
+                        m_dm_dmu2[global_idx]       = d_m_dmu2;
+                        m_dm_dsigma2_sq[global_idx] = d_m_dsigma2_sq;
                     }
                 }
             }
@@ -484,7 +502,7 @@ struct FusedSSIMBackwardKernel{
     }
 };
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 fusedssim(
     float C1,
     float C2,
@@ -505,6 +523,8 @@ fusedssim(
     auto dm_dmu1       = train ? torch::zeros_like(img1) : torch::empty({0}, img1.options());
     auto dm_dsigma1_sq = train ? torch::zeros_like(img1) : torch::empty({0}, img1.options());
     auto dm_dsigma12   = train ? torch::zeros_like(img1) : torch::empty({0}, img1.options());
+    auto dm_dmu2       = train ? torch::zeros_like(img1) : torch::empty({0}, img1.options());
+    auto dm_dsigma2_sq = train ? torch::zeros_like(img1) : torch::empty({0}, img1.options());
 
     // Get data pointers to contiguous tensors
     float* img1_ptr = img1.contiguous().data_ptr<float>();
@@ -544,6 +564,8 @@ fusedssim(
                 train ? dm_dmu1.data_ptr<float>()       : nullptr,
                 train ? dm_dsigma1_sq.data_ptr<float>() : nullptr,
                 train ? dm_dsigma12.data_ptr<float>()   : nullptr,
+                train ? dm_dmu2.data_ptr<float>()       : nullptr,
+                train ? dm_dsigma2_sq.data_ptr<float>() : nullptr,
                 sTile,
                 xconv   
             );
@@ -552,7 +574,7 @@ fusedssim(
     );
     e.wait();
 
-    return std::make_tuple(ssim_map, dm_dmu1, dm_dsigma1_sq, dm_dsigma12);
+    return std::make_tuple(ssim_map, dm_dmu1, dm_dsigma1_sq, dm_dsigma12, dm_dmu2, dm_dsigma2_sq);
 }
 
 torch::Tensor
@@ -628,4 +650,83 @@ fusedssim_backward(
     e.wait();
 
     return dL_dimg1;
+}
+
+// Similar backward kernel for img2 - reuses FusedSSIMBackwardKernel structure
+// but with different derivative inputs
+torch::Tensor
+fusedssim_backward_img2(
+    float C1,
+    float C2,
+    torch::Tensor &img1,
+    torch::Tensor &img2,
+    torch::Tensor &dL_dmap,
+    torch::Tensor &dm_dmu2,
+    torch::Tensor &dm_dsigma2_sq,
+    torch::Tensor &dm_dsigma12
+) {
+
+    // Get dimensions
+    int B  = img1.size(0);
+    int CH = img1.size(1);
+    int H  = img1.size(2);
+    int W  = img1.size(3);
+
+    // Create output gradient tensor
+    auto dL_dimg2 = torch::zeros_like(img2);
+
+    // Get data pointers to contiguous tensors
+    float* img1_ptr = img1.contiguous().data_ptr<float>();
+    float* img2_ptr = img2.contiguous().data_ptr<float>();
+    float* dL_dmap_ptr = dL_dmap.contiguous().data_ptr<float>();
+    float* dm_dmu2_ptr = dm_dmu2.contiguous().data_ptr<float>();
+    float* dm_dsigma2_sq_ptr = dm_dsigma2_sq.contiguous().data_ptr<float>();
+    float* dm_dsigma12_ptr = dm_dsigma12.contiguous().data_ptr<float>();
+
+    // Declare kernel launch parameters
+    sycl::range<3> localRange{
+        BLOCK_X, 
+        BLOCK_Y, 
+        1
+    };
+    sycl::range<3> globalRange{ 
+        static_cast<size_t>(((W + BLOCK_X - 1) / BLOCK_X)*BLOCK_X), 
+        static_cast<size_t>(((H + BLOCK_Y - 1) / BLOCK_Y)*BLOCK_Y), 
+        static_cast<size_t>(B)
+    };
+    sycl::nd_range<3> range(globalRange, localRange);
+
+    // launch the kernel and wait for it to terminate
+    auto& d_queue = at::xpu::getCurrentXPUStream().queue();
+    auto e = d_queue.submit(
+        [&](sycl::handler& cgh)
+        {
+            sycl::range<3> sData_range(3, SHARED_Y, SHARED_X);
+            sycl::local_accessor<float, 3> sData(sData_range, cgh);
+
+            sycl::range<3> sScratch_range(CONV_Y, CONV_X, 3);
+            sycl::local_accessor<float, 3> sScratch(sScratch_range, cgh);
+
+            // Note: We pass img2 as first arg and use p2 for the gradient computation
+            // The kernel computes: dL_dpix = sum0 + (2.f * p2) * sum1 + (p1) * sum2
+            FusedSSIMBackwardKernel 
+            kernel
+            (
+                H, W, CH, C1, C2,
+                img1_ptr,
+                img2_ptr,
+                dL_dmap_ptr,
+                dL_dimg2.data_ptr<float>(),
+                dm_dmu2_ptr,
+                dm_dsigma2_sq_ptr,
+                dm_dsigma12_ptr,
+                sData,
+                sScratch
+            );
+            cgh.parallel_for(range, kernel);
+        }
+    );
+    e.wait();
+
+    return dL_dimg2;
 }
